@@ -24,6 +24,15 @@ jobs:
           sparse-checkout-cone-mode: false
           fetch-depth: 1
 
+      # Dừng sớm nếu thiếu file đầu vào (đỡ mất 10 phút build rồi mới biết)
+      - name: Kiểm tra file đầu vào
+        run: |
+          ls -l
+          for f in stock_config.txt boot.img.xz; do
+            test -f "$f" || { echo "::error::Thiếu $f ở gốc nhánh ${{ github.ref_name }}. Hãy thêm vào đúng nhánh này."; exit 1; }
+          done
+          xz -t boot.img.xz
+
       - name: Cài công cụ
         run: |
           sudo apt-get update
@@ -82,19 +91,23 @@ jobs:
           echo 'subdir-ccflags-y += -include $(srctree)/include/linux/ksu_compat419.h' >> KernelSU/kernel/Makefile
           grep -rl MODULE_IMPORT_NS KernelSU/kernel --include='*.c' --include='*.h' | xargs -r sed -i '/MODULE_IMPORT_NS/d'
           ! grep -rn MODULE_IMPORT_NS KernelSU/kernel --include='*.c' --include='*.h'
+          # throne_comm.c dùng struct proc_ops (kernel 5.6+); 4.19 dùng file_operations
+          F=KernelSU/kernel/throne_comm.c
+          if grep -q 'struct proc_ops' "$F"; then
+            sed -i -e 's/struct proc_ops/struct file_operations/' \
+                   -e 's/\.proc_open\b/.open/' -e 's/\.proc_read\b/.read/' \
+                   -e 's/\.proc_write\b/.write/' -e 's/\.proc_lseek\b/.llseek/' \
+                   -e 's/\.proc_release\b/.release/' "$F"
+          fi
+          ! grep -n 'proc_ops\|\.proc_' "$F"
+          sed -n '/file_operations/,/};/p' "$F"
 
       - name: Cấu hình
         working-directory: android/kernel/msm-4.19
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           mkdir -p out
-          if [ -f "$GITHUB_WORKSPACE/stock_config.txt" ]; then
-            echo "Dùng stock_config.txt (config kernel gốc)"
-            cp "$GITHUB_WORKSPACE/stock_config.txt" out/.config
-          else
-            echo "::warning::Không thấy stock_config.txt, dùng tạm vendor/bengal-perf_defconfig"
-            make O=out ARCH=arm64 CC=clang vendor/bengal-perf_defconfig
-          fi
+          cp "$GITHUB_WORKSPACE/stock_config.txt" out/.config
           scripts/config --file out/.config \
             -d MODULE_SIG_FORCE -d MODULE_SIG_ALL \
             --set-str LOCALVERSION "-perf" -d LOCALVERSION_AUTO \
@@ -160,8 +173,11 @@ jobs:
               pos = page
               def take(n):
                   nonlocal pos
-                  assert pos + n <= len(d), f'boot gốc bị cắt: cần {n} byte tại {pos}, file chỉ {len(d)}'
-                  b = d[pos:pos+n]; pos += n + pad(n, page); return b
+                  end = pos + n
+                  nxt = end + pad(n, page)
+                  assert end <= len(d), f'boot gốc bị cắt: thiếu dữ liệu tại {pos}'
+                  assert nxt <= len(d), f'boot gốc bị cắt: thiếu padding sau vị trí {end}'
+                  b = d[pos:end]; pos = nxt; return b
               old_k = take(ksz); ram = take(rsz); sec = take(ssz)
               rdt = take(rdsz) if hv >= 1 else b''
               dtb = take(dtbsz) if hv == 2 else b''
