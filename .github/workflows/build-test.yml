@@ -1,0 +1,76 @@
+# Replace the existing kernel configuration step with this step.
+# It explicitly selects LTO_NONE and disables Shadow Call Stack,
+# then runs olddefconfig non-interactively and verifies the resulting .config.
+
+- name: Configure kernel
+  shell: bash
+  run: |
+    set -euo pipefail
+
+    test -s stock_config.txt || {
+      echo "::error::stock_config.txt is missing or empty"
+      exit 1
+    }
+
+    mkdir -p out
+    cp stock_config.txt out/.config
+
+    scripts/config --file out/.config \
+      -d MODULE_SIG_FORCE \
+      -d MODULE_SIG_ALL \
+      --set-str LOCALVERSION "-perf" \
+      -d LOCALVERSION_AUTO \
+      -e KPROBES \
+      -e KPROBE_EVENTS \
+      -e KALLSYMS \
+      -e KALLSYMS_ALL \
+      -e OVERLAY_FS \
+      -e KSU \
+      -e KSU_KPROBES_HOOK \
+      -e LTO_NONE \
+      -d LTO_CLANG \
+      -d SHADOW_CALL_STACK
+
+    echo "=== Config before olddefconfig ==="
+    grep -E '^(CONFIG_(LTO|LTO_NONE|LTO_CLANG|SHADOW_CALL_STACK|KSU|KPROBES)=|# CONFIG_(LTO_CLANG|SHADOW_CALL_STACK) is not set)' out/.config || true
+
+    # Do not pipe a stream of Enter keys into Kconfig.
+    # If this kernel still requests interactive input, fail and preserve the log.
+    set +e
+    make O=out ARCH=arm64 CC=clang olddefconfig </dev/null 2>&1 | tee kconfig.log
+    status=${PIPESTATUS[0]}
+    set -e
+
+    if [ "$status" -ne 0 ]; then
+      echo "::error::olddefconfig failed; see kconfig.log"
+      exit "$status"
+    fi
+
+    echo "=== Config after olddefconfig ==="
+    grep -E '^(CONFIG_(LTO|LTO_NONE|LTO_CLANG|SHADOW_CALL_STACK|KSU|KPROBES)=|# CONFIG_(LTO_CLANG|SHADOW_CALL_STACK) is not set)' out/.config || true
+
+    grep -q '^CONFIG_LTO_NONE=y$' out/.config || {
+      echo "::error::CONFIG_LTO_NONE=y was not retained"
+      exit 1
+    }
+
+    grep -q '^# CONFIG_LTO_CLANG is not set$' out/.config || {
+      echo "::error::LTO_CLANG is unexpectedly enabled"
+      exit 1
+    }
+
+    grep -q '^# CONFIG_SHADOW_CALL_STACK is not set$' out/.config || {
+      echo "::error::SHADOW_CALL_STACK is unexpectedly enabled"
+      exit 1
+    }
+
+    grep -q '^CONFIG_KSU=y$' out/.config || {
+      echo "::error::CONFIG_KSU=y is missing"
+      exit 1
+    }
+
+    grep -q '^CONFIG_KSU_KPROBES_HOOK=y$' out/.config || {
+      echo "::error::CONFIG_KSU_KPROBES_HOOK=y is missing"
+      exit 1
+    }
+    
