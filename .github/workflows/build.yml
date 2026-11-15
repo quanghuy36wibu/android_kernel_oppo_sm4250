@@ -24,24 +24,37 @@ jobs:
           sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio zip \
             python3 git curl gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
-      - name: Clone kernel source
+      # OPPO tách source làm 2 repo: kernel (msm-4.19) và vendor/oplus + techpack.
+      # Source kernel dùng symlink ../../../vendor/... nên phải dựng đúng cấu trúc:
+      #   android/kernel/msm-4.19  +  android/vendor
+      - name: Clone kernel source + vendor modules
         run: |
+          mkdir -p android/kernel
           git clone --depth=1 -b "${{ inputs.branch }}" \
-            https://github.com/oppo-source/android_kernel_oppo_sm4250.git ksrc
-          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' ksrc/Makefile | head -3
+            https://github.com/oppo-source/android_kernel_oppo_sm4250.git android/kernel/msm-4.19
+          git clone --depth=1 -b "${{ inputs.branch }}" \
+            https://github.com/oppo-source/android_kernel_modules_and_devicetree_oppo_sm4250.git mods
+          cp -a mods/source/android/vendor android/vendor
+          for t in display camera video; do
+            rm -rf android/kernel/msm-4.19/techpack/$t
+            cp -a mods/source/android/kernel/msm-4.19/techpack/$t android/kernel/msm-4.19/techpack/$t
+          done
+          cd android/kernel/msm-4.19
+          echo "Symlink hỏng: $(find . -xtype l -not -path './.git/*' | wc -l)"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile | head -3
 
       - name: Clone Clang (Proton)
         run: git clone --depth=1 https://github.com/kdrag0n/proton-clang.git clang
 
       # SukiSU-Ultra: hook bằng KPROBES, hợp kernel 4.19 non-GKI
       - name: Tích hợp KernelSU (SukiSU-Ultra)
-        working-directory: ksrc
+        working-directory: android/kernel/msm-4.19
         run: |
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
           ls drivers/kernelsu | head
 
       - name: Cấu hình
-        working-directory: ksrc
+        working-directory: android/kernel/msm-4.19
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           mkdir -p out
@@ -62,7 +75,7 @@ jobs:
           grep -q '^CONFIG_KSU=y' out/.config || { echo "KSU KHÔNG được bật"; exit 1; }
 
       - name: Build
-        working-directory: ksrc
+        working-directory: android/kernel/msm-4.19
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           make -j$(nproc) O=out ARCH=arm64 CC=clang LD=ld.lld \
@@ -75,7 +88,7 @@ jobs:
       - name: Đóng gói AnyKernel3
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
-          B=ksrc/out/arch/arm64/boot
+          B=android/kernel/msm-4.19/out/arch/arm64/boot
           if   [ -f $B/Image.gz-dtb ]; then cp $B/Image.gz-dtb ak3/
           elif [ -f $B/Image.gz ];     then cp $B/Image.gz ak3/
           else cp $B/Image ak3/; fi
@@ -87,4 +100,4 @@ jobs:
           name: kernel-ksu
           path: |
             kernel-ksu.zip
-            ksrc/build.log
+            android/kernel/msm-4.19/build.log
