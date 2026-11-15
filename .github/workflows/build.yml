@@ -10,6 +10,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    env:
+      # Makefile của OPPO chọn driver/platform theo biến này (bengal = SM4250)
+      TARGET_PRODUCT: bengal
+      TARGET_BOARD_PLATFORM: bengal
     steps:
       # lấy stock_config.txt nằm trong repo này
       - uses: actions/checkout@v4
