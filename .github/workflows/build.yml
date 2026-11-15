@@ -56,9 +56,38 @@ jobs:
         run: |
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
           ls drivers/kernelsu | head
-          # Kernel 4.19 chưa có MODULE_IMPORT_NS (từ 5.4) -> bỏ các dòng này
-          grep -rl MODULE_IMPORT_NS KernelSU/kernel | xargs -r sed -i '/MODULE_IMPORT_NS/d'
-          grep -rn MODULE_IMPORT_NS KernelSU/kernel || echo "đã bỏ MODULE_IMPORT_NS"
+          # Kernel 4.19 chưa có MODULE_IMPORT_NS; xử lý tại cây source thực tế.
+          for d in drivers/kernelsu KernelSU/kernel; do
+            if [ -d "$d" ]; then
+              grep -rl MODULE_IMPORT_NS "$d" --include='*.c' --include='*.h' \
+                | xargs -r sed -i '/MODULE_IMPORT_NS/d'
+              if grep -rn MODULE_IMPORT_NS "$d" --include='*.c' --include='*.h'; then
+                echo "::error::Vẫn còn MODULE_IMPORT_NS trong $d"
+                exit 1
+              fi
+            fi
+          done
+          test -f drivers/kernelsu/feature/sucompat.c || {
+            echo "::error::Không tìm thấy drivers/kernelsu/feature/sucompat.c"
+            find . -path '*/sucompat.c' -print
+            exit 1
+          }
+
+      # Linux 4.19 của thiết bị này không cung cấp linux/pgtable.h.
+      # Thử dùng header kiến trúc ARM64 tương ứng trong sucompat.c.
+      - name: Vá pgtable header cho kernel 4.19
+        working-directory: android/kernel/msm-4.19
+        run: |
+          FILE="drivers/kernelsu/feature/sucompat.c"
+          if grep -q '^#include <linux/pgtable.h>' "$FILE"; then
+            sed -i 's|^#include <linux/pgtable.h>|#include <asm/pgtable.h>|' "$FILE"
+          fi
+          echo "Các header page-table trong sucompat.c:"
+          grep -nE 'pgtable\.h|page\.h' "$FILE" || true
+          if grep -q '^#include <linux/pgtable.h>' "$FILE"; then
+            echo "::error::Chưa thay được linux/pgtable.h"
+            exit 1
+          fi
 
       - name: Cấu hình
         working-directory: android/kernel/msm-4.19
