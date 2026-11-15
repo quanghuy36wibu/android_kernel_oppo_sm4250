@@ -13,6 +13,10 @@ jobs:
     steps:
       # lấy stock_config.txt nằm trong repo này
       - uses: actions/checkout@v4
+        with:
+          sparse-checkout: stock_config.txt
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
 
       - name: Cài công cụ
         run: |
@@ -23,21 +27,21 @@ jobs:
       - name: Clone kernel source
         run: |
           git clone --depth=1 -b "${{ inputs.branch }}" \
-            https://github.com/oppo-source/android_kernel_oppo_sm4250.git kernel
-          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile | head -3
+            https://github.com/oppo-source/android_kernel_oppo_sm4250.git ksrc
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' ksrc/Makefile | head -3
 
       - name: Clone Clang (Proton)
         run: git clone --depth=1 https://github.com/kdrag0n/proton-clang.git clang
 
       # SukiSU-Ultra: hook bằng KPROBES, hợp kernel 4.19 non-GKI
       - name: Tích hợp KernelSU (SukiSU-Ultra)
-        working-directory: kernel
+        working-directory: ksrc
         run: |
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
           ls drivers/kernelsu | head
 
       - name: Cấu hình
-        working-directory: kernel
+        working-directory: ksrc
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           mkdir -p out
@@ -52,7 +56,7 @@ jobs:
           grep -q '^CONFIG_KSU=y' out/.config || { echo "KSU KHÔNG được bật"; exit 1; }
 
       - name: Build
-        working-directory: kernel
+        working-directory: ksrc
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           make -j$(nproc) O=out ARCH=arm64 CC=clang LD=ld.lld \
@@ -65,7 +69,7 @@ jobs:
       - name: Đóng gói AnyKernel3
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
-          B=kernel/out/arch/arm64/boot
+          B=ksrc/out/arch/arm64/boot
           if   [ -f $B/Image.gz-dtb ]; then cp $B/Image.gz-dtb ak3/
           elif [ -f $B/Image.gz ];     then cp $B/Image.gz ak3/
           else cp $B/Image ak3/; fi
@@ -77,5 +81,4 @@ jobs:
           name: kernel-ksu
           path: |
             kernel-ksu.zip
-            kernel/build.log
-            
+            ksrc/build.log
