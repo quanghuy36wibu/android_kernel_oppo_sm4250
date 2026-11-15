@@ -45,7 +45,13 @@ jobs:
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           mkdir -p out
-          cp "$GITHUB_WORKSPACE/stock_config.txt" out/.config
+          if [ -f "$GITHUB_WORKSPACE/stock_config.txt" ]; then
+            echo "Dùng stock_config.txt (config kernel gốc)"
+            cp "$GITHUB_WORKSPACE/stock_config.txt" out/.config
+          else
+            echo "::warning::Không thấy stock_config.txt, dùng tạm vendor/bengal-perf_defconfig"
+            make O=out ARCH=arm64 CC=clang vendor/bengal-perf_defconfig
+          fi
           scripts/config --file out/.config \
             -d MODULE_SIG_FORCE -d MODULE_SIG_ALL \
             --set-str LOCALVERSION "-perf" -d LOCALVERSION_AUTO \
