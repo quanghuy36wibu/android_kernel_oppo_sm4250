@@ -11,11 +11,10 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     env:
-      # Makefile của OPPO chọn driver/platform theo biến này (bengal = SM4250)
       TARGET_PRODUCT: bengal
       TARGET_BOARD_PLATFORM: bengal
+
     steps:
-      # lấy stock_config.txt nằm trong repo này
       - uses: actions/checkout@v4
         with:
           sparse-checkout: |
@@ -24,200 +23,398 @@ jobs:
           sparse-checkout-cone-mode: false
           fetch-depth: 1
 
-      # Dừng sớm nếu thiếu file đầu vào (đỡ mất 10 phút build rồi mới biết)
       - name: Kiểm tra file đầu vào
         run: |
           ls -l
           for f in stock_config.txt boot.img.xz; do
-            test -f "$f" || { echo "::error::Thiếu $f ở gốc nhánh ${{ github.ref_name }}. Hãy thêm vào đúng nhánh này."; exit 1; }
+            test -f "$f" || {
+              echo "::error::Thiếu $f ở gốc nhánh ${{ github.ref_name }}"
+              exit 1
+            }
           done
           xz -t boot.img.xz
 
       - name: Cài công cụ
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio zip \
+          sudo apt-get install -y \
+            bc bison flex libssl-dev libelf-dev cpio zip \
             python3 git curl gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
-      # OPPO tách source làm 2 repo: kernel (msm-4.19) và vendor/oplus + techpack.
-      # Source kernel dùng symlink ../../../vendor/... nên phải dựng đúng cấu trúc:
-      #   android/kernel/msm-4.19  +  android/vendor
       - name: Clone kernel source + vendor modules
         run: |
           mkdir -p android/kernel
+
           git clone --depth=1 -b "${{ inputs.branch }}" \
-            https://github.com/oppo-source/android_kernel_oppo_sm4250.git android/kernel/msm-4.19
+            https://github.com/oppo-source/android_kernel_oppo_sm4250.git \
+            android/kernel/msm-4.19
+
           git clone --depth=1 -b "${{ inputs.branch }}" \
-            https://github.com/oppo-source/android_kernel_modules_and_devicetree_oppo_sm4250.git mods
+            https://github.com/oppo-source/android_kernel_modules_and_devicetree_oppo_sm4250.git \
+            mods
+
           cp -a mods/source/android/vendor android/vendor
+
           for t in display camera video; do
-            rm -rf android/kernel/msm-4.19/techpack/$t
-            cp -a mods/source/android/kernel/msm-4.19/techpack/$t android/kernel/msm-4.19/techpack/$t
+            rm -rf "android/kernel/msm-4.19/techpack/$t"
+            cp -a "mods/source/android/kernel/msm-4.19/techpack/$t" \
+              "android/kernel/msm-4.19/techpack/$t"
           done
+
           cd android/kernel/msm-4.19
           echo "Symlink hỏng: $(find . -xtype l -not -path './.git/*' | wc -l)"
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile | head -3
 
       - name: Clone Clang (Proton)
-        run: git clone --depth=1 https://github.com/kdrag0n/proton-clang.git clang
+        run: |
+          git clone --depth=1 \
+            https://github.com/kdrag0n/proton-clang.git clang
 
-      # Bản SukiSU-Ultra mới (main, v4.x) viết cho kernel 5.x/6.x, không build được trên 4.19.
-      # Ghim v3.2.0: còn hook bằng KPROBES (KSU_KPROBES_HOOK) và ít API mới hơn.
       - name: Tích hợp KernelSU (SukiSU-Ultra v3.2.0)
         working-directory: android/kernel/msm-4.19
         run: |
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/v3.2.0/kernel/setup.sh" | bash -s v3.2.0
+          curl -LSs \
+            "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/v3.2.0/kernel/setup.sh" \
+            | bash -s v3.2.0
+
           ls KernelSU/kernel | head -30
-          test -f KernelSU/kernel/ksu.c || { echo "::error::Không thấy KernelSU/kernel/ksu.c"; exit 1; }
+
+          test -f KernelSU/kernel/ksu.c || {
+            echo "::error::Không thấy KernelSU/kernel/ksu.c"
+            exit 1
+          }
+
           git -C KernelSU describe --tags --always
 
-      # Kernel 4.19 thiếu MODULE_IMPORT_NS (5.4+) và các hàm *_nofault (5.8+).
-      # Tạo header tương thích và ép include vào mọi file của KernelSU.
       - name: Vá tương thích kernel 4.19
         working-directory: android/kernel/msm-4.19
         run: |
           cat > include/linux/ksu_compat419.h <<'EOF2'
           #ifndef _KSU_COMPAT419_H
           #define _KSU_COMPAT419_H
-          /* Chỉ dùng macro, không include gì để an toàn khi bị -include sớm */
-          #define strncpy_from_user_nofault(dst, src, cnt) strncpy_from_user((dst), (src), (cnt))
-          #define copy_from_user_nofault(dst, src, size) ({ long __ksu_r; pagefault_disable(); __ksu_r = __copy_from_user_inatomic((dst), (src), (size)) ? -EFAULT : 0; pagefault_enable(); __ksu_r; })
-          #define copy_to_user_nofault(dst, src, size) ({ long __ksu_r; pagefault_disable(); __ksu_r = __copy_to_user_inatomic((dst), (src), (size)) ? -EFAULT : 0; pagefault_enable(); __ksu_r; })
-          #define copy_from_kernel_nofault(dst, src, size) probe_kernel_read((dst), (src), (size))
-          #define copy_to_kernel_nofault(dst, src, size) probe_kernel_write((dst), (src), (size))
+
+          #define strncpy_from_user_nofault(dst, src, cnt) \
+            strncpy_from_user((dst), (src), (cnt))
+
+          #define copy_from_user_nofault(dst, src, size) ({ \
+            long __ksu_r; \
+            pagefault_disable(); \
+            __ksu_r = __copy_from_user_inatomic((dst), (src), (size)) ? -EFAULT : 0; \
+            pagefault_enable(); \
+            __ksu_r; \
+          })
+
+          #define copy_to_user_nofault(dst, src, size) ({ \
+            long __ksu_r; \
+            pagefault_disable(); \
+            __ksu_r = __copy_to_user_inatomic((dst), (src), (size)) ? -EFAULT : 0; \
+            pagefault_enable(); \
+            __ksu_r; \
+          })
+
+          #define copy_from_kernel_nofault(dst, src, size) \
+            probe_kernel_read((dst), (src), (size))
+
+          #define copy_to_kernel_nofault(dst, src, size) \
+            probe_kernel_write((dst), (src), (size))
+
           #endif
           EOF2
-          cat include/linux/ksu_compat419.h
-          echo 'subdir-ccflags-y += -include $(srctree)/include/linux/ksu_compat419.h' >> KernelSU/kernel/Makefile
-          grep -rl MODULE_IMPORT_NS KernelSU/kernel --include='*.c' --include='*.h' | xargs -r sed -i '/MODULE_IMPORT_NS/d'
-          ! grep -rn MODULE_IMPORT_NS KernelSU/kernel --include='*.c' --include='*.h'
-          # throne_comm.c dùng struct proc_ops (kernel 5.6+); 4.19 dùng file_operations
+
+          echo 'subdir-ccflags-y += -include $(srctree)/include/linux/ksu_compat419.h' \
+            >> KernelSU/kernel/Makefile
+
+          grep -rl MODULE_IMPORT_NS KernelSU/kernel \
+            --include='*.c' --include='*.h' \
+            | xargs -r sed -i '/MODULE_IMPORT_NS/d'
+
+          ! grep -rn MODULE_IMPORT_NS KernelSU/kernel \
+            --include='*.c' --include='*.h'
+
           F=KernelSU/kernel/throne_comm.c
+
           if grep -q 'struct proc_ops' "$F"; then
-            sed -i -e 's/struct proc_ops/struct file_operations/' \
-                   -e 's/\.proc_open\b/.open/' -e 's/\.proc_read\b/.read/' \
-                   -e 's/\.proc_write\b/.write/' -e 's/\.proc_lseek\b/.llseek/' \
-                   -e 's/\.proc_release\b/.release/' "$F"
+            sed -i \
+              -e 's/struct proc_ops/struct file_operations/' \
+              -e 's/\.proc_open\b/.open/' \
+              -e 's/\.proc_read\b/.read/' \
+              -e 's/\.proc_write\b/.write/' \
+              -e 's/\.proc_lseek\b/.llseek/' \
+              -e 's/\.proc_release\b/.release/' \
+              "$F"
           fi
+
           ! grep -n 'proc_ops\|\.proc_' "$F"
           sed -n '/file_operations/,/};/p' "$F"
 
       - name: Cấu hình
         working-directory: android/kernel/msm-4.19
         run: |
+          set -euo pipefail
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+
           mkdir -p out
           cp "$GITHUB_WORKSPACE/stock_config.txt" out/.config
+
           scripts/config --file out/.config \
-            -d MODULE_SIG_FORCE -d MODULE_SIG_ALL \
-            --set-str LOCALVERSION "-perf" -d LOCALVERSION_AUTO \
-            -e KPROBES -e KPROBE_EVENTS -e KALLSYMS -e KALLSYMS_ALL \
-            -e OVERLAY_FS -e KSU -e KSU_KPROBES_HOOK
-          make O=out ARCH=arm64 CC=clang olddefconfig
-          grep -E '^CONFIG_(KSU|KPROBES|KRETPROBES|EXT4_FS|OVERLAY_FS|MODULE_SIG_FORCE|LOCALVERSION)' out/.config
-          grep -q '^CONFIG_KSU=y' out/.config || { echo "KSU KHÔNG được bật"; exit 1; }
-          grep -q '^CONFIG_KSU_KPROBES_HOOK=y' out/.config || { echo "KSU_KPROBES_HOOK KHÔNG được bật"; exit 1; }
+            -d MODULE_SIG_FORCE \
+            -d MODULE_SIG_ALL \
+            --set-str LOCALVERSION "-perf" \
+            -d LOCALVERSION_AUTO \
+            -e KPROBES \
+            -e KPROBE_EVENTS \
+            -e KALLSYMS \
+            -e KALLSYMS_ALL \
+            -e OVERLAY_FS \
+            -e KSU \
+            -e KSU_KPROBES_HOOK \
+            -e LTO_NONE \
+            -d LTO_CLANG \
+            -d SHADOW_CALL_STACK
+
+          # Answer any remaining Kconfig prompts with their defaults.
+          python3 - <<'PY'
+          import subprocess
+
+          cmd = [
+              "make",
+              "O=out",
+              "ARCH=arm64",
+              "CC=clang",
+              "olddefconfig",
+          ]
+
+          p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+          p.communicate(input=b"\n" * 200)
+
+          if p.returncode != 0:
+              raise SystemExit(p.returncode)
+          PY
+
+          echo "===== Kernel config ====="
+          grep -E '^CONFIG_(KSU|KSU_KPROBES_HOOK|KPROBES|KRETPROBES|EXT4_FS|OVERLAY_FS|MODULE_SIG_FORCE|LOCALVERSION|LTO_NONE|LTO_CLANG|SHADOW_CALL_STACK)=' \
+            out/.config || true
+
+          grep -q '^CONFIG_KSU=y' out/.config || {
+            echo "::error::KSU KHÔNG được bật"
+            exit 1
+          }
+
+          grep -q '^CONFIG_KSU_KPROBES_HOOK=y' out/.config || {
+            echo "::error::KSU_KPROBES_HOOK KHÔNG được bật"
+            exit 1
+          }
+
+          grep -q '^CONFIG_LTO_NONE=y' out/.config || {
+            echo "::error::LTO_NONE chưa được bật"
+            exit 1
+          }
 
       - name: Build
         working-directory: android/kernel/msm-4.19
         run: |
           set -euo pipefail
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
-          make -j"$(nproc)" O=out ARCH=arm64 CC=clang LD=ld.lld \
+
+          make -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LD=ld.lld \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            CLANG_TRIPLE=aarch64-linux-gnu- 2>&1 | tee build.log
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            2>&1 | tee build.log
+
           test -f out/arch/arm64/boot/Image
+
           ls -lh out/arch/arm64/boot/
           strings out/arch/arm64/boot/Image | grep -m1 "Linux version"
 
-      # Đóng gói bằng cách thay kernel trong boot.img gốc (giữ ramdisk, dtb, cmdline).
-      # Cần boot.img.xz (boot gốc của máy) nằm ở gốc repo, cạnh stock_config.txt.
-      # Không dùng AnyKernel3 vì file anykernel.sh mặc định là mẫu, chưa khai báo máy/phân vùng.
-      - name: Đóng gói boot.img (thay kernel vào boot gốc)
+      - name: Đóng gói boot.img
         run: |
           set -euo pipefail
+
           B=android/kernel/msm-4.19/out/arch/arm64/boot
-          if   [ -f "$B/Image.gz" ]; then cp "$B/Image.gz" kernel.gz
-          elif [ -f "$B/Image" ];    then gzip -9 -c "$B/Image" > kernel.gz
-          else echo "::error::Không tìm thấy kernel Image"; exit 1; fi
-          ls -l kernel.gz
+
+          if [ -f "$B/Image.gz" ]; then
+            cp "$B/Image.gz" kernel.gz
+          elif [ -f "$B/Image" ]; then
+            gzip -9 -c "$B/Image" > kernel.gz
+          else
+            echo "::error::Không tìm thấy kernel Image"
+            exit 1
+          fi
+
+          ls -lh kernel.gz
+
           cat > repack_boot.py <<'PY'
           #!/usr/bin/env python3
-          """Thay kernel trong boot.img (header v0-v2), giữ nguyên ramdisk/dtb/cmdline."""
-          import struct, sys, hashlib
+          import struct
+          import sys
+          import hashlib
 
-          def pad(n, page): return (-n) % page
+          def pad(n, page):
+              return (-n) % page
 
           def main(stock, kernel, out):
-              d = open(stock, 'rb').read()
-              k = open(kernel, 'rb').read()
-              assert d[:8] == b'ANDROID!', 'không phải boot.img Android'
-              (ksz, kaddr, rsz, raddr, ssz, saddr, taddr, page, hv, osv) = struct.unpack_from('<10I', d, 8)
-              name = d[48:64]; cmd = d[64:576]; extra = d[608:1632]
-              assert hv <= 2, f'header v{hv} chưa hỗ trợ'
-              assert page in (2048, 4096, 8192, 16384), f'page size lạ: {page}'
-              # định dạng kernel: gốc và mới phải cùng loại (gzip hay raw)
+              with open(stock, 'rb') as f:
+                  d = f.read()
+
+              with open(kernel, 'rb') as f:
+                  k = f.read()
+
+              assert d[:8] == b'ANDROID!', 'Không phải boot.img Android'
+
+              (ksz, kaddr, rsz, raddr, ssz, saddr,
+               taddr, page, hv, osv) = struct.unpack_from('<10I', d, 8)
+
+              name = d[48:64]
+              cmd = d[64:576]
+              extra = d[608:1632]
+
+              assert hv <= 2, f'Header v{hv} chưa hỗ trợ'
+              assert page in (2048, 4096, 8192, 16384), \
+                  f'Page size lạ: {page}'
+
               kfmt = lambda b: 'gzip' if b[:2] == b'\x1f\x8b' else 'raw'
-              sk = d[page:page+ksz]
-              assert kfmt(sk) == kfmt(k), f'kernel gốc là {kfmt(sk)} nhưng kernel mới là {kfmt(k)}'
-              rdsz = rdoff = hdrsz = dtbsz = 0; dtbaddr = 0
+              sk = d[page:page + ksz]
+
+              assert kfmt(sk) == kfmt(k), \
+                  f'Kernel gốc là {kfmt(sk)} nhưng kernel mới là {kfmt(k)}'
+
+              rdsz = rdoff = hdrsz = dtbsz = 0
+              dtbaddr = 0
+
               if hv >= 1:
                   rdsz, rdoff, hdrsz = struct.unpack_from('<IQI', d, 1632)
+
               if hv == 2:
                   dtbsz, dtbaddr = struct.unpack_from('<IQ', d, 1648)
+
               if hv >= 1:
-                  assert hdrsz == {1: 1648, 2: 1660}[hv], f'header_size {hdrsz} không khớp header v{hv}'
-                  exp = page + sum(n + pad(n, page) for n in (ksz, rsz, ssz))
-                  assert rdsz == 0 or rdoff == exp, f'recovery_dtbo_offset {rdoff} khác vị trí tính được {exp}'
+                  assert hdrsz == {1: 1648, 2: 1660}[hv], \
+                      f'header_size {hdrsz} không khớp header v{hv}'
+
+                  exp = page + sum(
+                      n + pad(n, page) for n in (ksz, rsz, ssz)
+                  )
+
+                  assert rdsz == 0 or rdoff == exp, \
+                      f'recovery_dtbo_offset {rdoff} khác vị trí tính được {exp}'
+
               pos = page
+
               def take(n):
                   nonlocal pos
                   end = pos + n
                   nxt = end + pad(n, page)
-                  assert end <= len(d), f'boot gốc bị cắt: thiếu dữ liệu tại {pos}'
-                  assert nxt <= len(d), f'boot gốc bị cắt: thiếu padding sau vị trí {end}'
-                  b = d[pos:end]; pos = nxt; return b
-              old_k = take(ksz); ram = take(rsz); sec = take(ssz)
+
+                  assert end <= len(d), \
+                      f'Boot gốc bị cắt: thiếu dữ liệu tại {pos}'
+
+                  assert nxt <= len(d), \
+                      f'Boot gốc bị cắt: thiếu padding sau vị trí {end}'
+
+                  b = d[pos:end]
+                  pos = nxt
+                  return b
+
+              old_k = take(ksz)
+              ram = take(rsz)
+              sec = take(ssz)
               rdt = take(rdsz) if hv >= 1 else b''
               dtb = take(dtbsz) if hv == 2 else b''
-              new_rdoff = page + len(k) + pad(len(k), page) + len(ram) + pad(len(ram), page) + len(sec) + pad(len(sec), page)
+
+              new_rdoff = (
+                  page + len(k) + pad(len(k), page)
+                  + len(ram) + pad(len(ram), page)
+                  + len(sec) + pad(len(sec), page)
+              )
+
               sha = hashlib.sha1()
+
               for b in (k, ram, sec):
-                  sha.update(b); sha.update(struct.pack('<I', len(b)))
-              if hv >= 1: sha.update(rdt); sha.update(struct.pack('<I', len(rdt)))
-              if hv == 2: sha.update(dtb); sha.update(struct.pack('<I', len(dtb)))
+                  sha.update(b)
+                  sha.update(struct.pack('<I', len(b)))
+
+              if hv >= 1:
+                  sha.update(rdt)
+                  sha.update(struct.pack('<I', len(rdt)))
+
+              if hv == 2:
+                  sha.update(dtb)
+                  sha.update(struct.pack('<I', len(dtb)))
+
               idb = sha.digest() + b'\0' * 12
               h = bytearray(page)
+
               h[0:8] = b'ANDROID!'
-              struct.pack_into('<10I', h, 8, len(k), kaddr, rsz, raddr, ssz, saddr, taddr, page, hv, osv)
-              h[48:64] = name; h[64:576] = cmd; h[576:608] = idb; h[608:1632] = extra
-              if hv >= 1: struct.pack_into('<IQI', h, 1632, rdsz, new_rdoff if rdsz else 0, hdrsz)
-              if hv == 2: struct.pack_into('<IQ', h, 1648, dtbsz, dtbaddr)
+
+              struct.pack_into(
+                  '<10I', h, 8,
+                  len(k), kaddr, rsz, raddr, ssz,
+                  saddr, taddr, page, hv, osv
+              )
+
+              h[48:64] = name
+              h[64:576] = cmd
+              h[576:608] = idb
+              h[608:1632] = extra
+
+              if hv >= 1:
+                  struct.pack_into(
+                      '<IQI', h, 1632,
+                      rdsz, new_rdoff if rdsz else 0, hdrsz
+                  )
+
+              if hv == 2:
+                  struct.pack_into('<IQ', h, 1648, dtbsz, dtbaddr)
+
               with open(out, 'wb') as f:
                   f.write(h)
+
                   for b in (k, ram, sec, rdt, dtb):
-                      f.write(b); f.write(b'\0' * pad(len(b), page))
-              # đọc lại ảnh vừa ghi và đối chiếu từng thành phần
-              o = open(out, 'rb').read()
+                      f.write(b)
+                      f.write(b'\0' * pad(len(b), page))
+
+              with open(out, 'rb') as f:
+                  o = f.read()
+
               p2 = page
-              for name_, want in (('kernel', k), ('ramdisk', ram), ('second', sec), ('recovery_dtbo', rdt), ('dtb', dtb)):
-                  assert o[p2:p2+len(want)] == want, f'đọc lại {name_} không khớp'
+
+              for name_, want in (
+                  ('kernel', k),
+                  ('ramdisk', ram),
+                  ('second', sec),
+                  ('recovery_dtbo', rdt),
+                  ('dtb', dtb),
+              ):
+                  assert o[p2:p2 + len(want)] == want, \
+                      f'Đọc lại {name_} không khớp'
+
                   p2 += len(want) + pad(len(want), page)
-              assert len(o) == p2, 'kích thước ảnh ra không khớp'
-              assert struct.unpack_from('<I', o, 8)[0] == len(k), 'kernel_size trong header sai'
-              print(f'header v{hv} page={page} kernel {len(old_k)} -> {len(k)} ramdisk={len(ram)} dtb={len(dtb)}')
+
+              assert len(o) == p2, 'Kích thước ảnh ra không khớp'
+              assert struct.unpack_from('<I', o, 8)[0] == len(k), \
+                  'kernel_size trong header sai'
+
+              print(
+                  f'Header v{hv}, page={page}, '
+                  f'kernel {len(old_k)} -> {len(k)}, '
+                  f'ramdisk={len(ram)}, dtb={len(dtb)}'
+              )
 
           if __name__ == '__main__':
               main(*sys.argv[1:4])
           PY
-          if [ -f boot.img.xz ]; then
-            xz -dkc boot.img.xz > stock_boot.img
-            python3 repack_boot.py stock_boot.img kernel.gz boot-new.img
-            ls -l boot-new.img
-          else
-            echo "::warning::Không thấy boot.img.xz trong repo; chỉ xuất kernel.gz"
-          fi
+
+          xz -dkc boot.img.xz > stock_boot.img
+
+          python3 repack_boot.py \
+            stock_boot.img kernel.gz boot-new.img
+
+          ls -lh boot-new.img
 
       - uses: actions/upload-artifact@v4
         if: always()
