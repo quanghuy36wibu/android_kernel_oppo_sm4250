@@ -1,0 +1,81 @@
+name: Build kernel + KernelSU (CPH2127)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Nhánh kernel source (oppo-source)"
+        default: "oppo/sm4250_r_11.1_a32"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      # lấy stock_config.txt nằm trong repo này
+      - uses: actions/checkout@v4
+
+      - name: Cài công cụ
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio zip \
+            python3 git curl gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 -b "${{ inputs.branch }}" \
+            https://github.com/oppo-source/android_kernel_oppo_sm4250.git kernel
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile | head -3
+
+      - name: Clone Clang (Proton)
+        run: git clone --depth=1 https://github.com/kdrag0n/proton-clang.git clang
+
+      # SukiSU-Ultra: hook bằng KPROBES, hợp kernel 4.19 non-GKI
+      - name: Tích hợp KernelSU (SukiSU-Ultra)
+        working-directory: kernel
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
+          ls drivers/kernelsu | head
+
+      - name: Cấu hình
+        working-directory: kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          mkdir -p out
+          cp "$GITHUB_WORKSPACE/stock_config.txt" out/.config
+          scripts/config --file out/.config \
+            -d MODULE_SIG_FORCE -d MODULE_SIG_ALL \
+            --set-str LOCALVERSION "-perf" -d LOCALVERSION_AUTO \
+            -e KPROBES -e KPROBE_EVENTS -e KALLSYMS -e KALLSYMS_ALL \
+            -e OVERLAY_FS -e KSU
+          make O=out ARCH=arm64 CC=clang olddefconfig
+          grep -E '^CONFIG_(KSU|KPROBES|MODULE_SIG_FORCE|LOCALVERSION)' out/.config
+          grep -q '^CONFIG_KSU=y' out/.config || { echo "KSU KHÔNG được bật"; exit 1; }
+
+      - name: Build
+        working-directory: kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          make -j$(nproc) O=out ARCH=arm64 CC=clang LD=ld.lld \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu- 2>&1 | tee build.log
+          ls out/arch/arm64/boot/
+          strings out/arch/arm64/boot/Image | grep -m1 "Linux version"
+
+      - name: Đóng gói AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          B=kernel/out/arch/arm64/boot
+          if   [ -f $B/Image.gz-dtb ]; then cp $B/Image.gz-dtb ak3/
+          elif [ -f $B/Image.gz ];     then cp $B/Image.gz ak3/
+          else cp $B/Image ak3/; fi
+          cd ak3 && rm -rf .git && zip -r9 ../kernel-ksu.zip .
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel-ksu
+          path: |
+            kernel-ksu.zip
+            kernel/build.log
+            
