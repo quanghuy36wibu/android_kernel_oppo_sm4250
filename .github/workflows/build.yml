@@ -18,7 +18,9 @@ jobs:
       # lấy stock_config.txt nằm trong repo này
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: stock_config.txt
+          sparse-checkout: |
+            stock_config.txt
+            boot.img.xz
           sparse-checkout-cone-mode: false
           fetch-depth: 1
 
@@ -50,65 +52,36 @@ jobs:
       - name: Clone Clang (Proton)
         run: git clone --depth=1 https://github.com/kdrag0n/proton-clang.git clang
 
-      # SukiSU-Ultra: hook bằng KPROBES, hợp kernel 4.19 non-GKI
-      - name: Tích hợp KernelSU (SukiSU-Ultra)
+      # Bản SukiSU-Ultra mới (main, v4.x) viết cho kernel 5.x/6.x, không build được trên 4.19.
+      # Ghim v3.2.0: còn hook bằng KPROBES (KSU_KPROBES_HOOK) và ít API mới hơn.
+      - name: Tích hợp KernelSU (SukiSU-Ultra v3.2.0)
         working-directory: android/kernel/msm-4.19
         run: |
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
-          ls drivers/kernelsu | head
-          # Kernel 4.19 chưa có MODULE_IMPORT_NS; xử lý tại cây source thực tế.
-          for d in drivers/kernelsu KernelSU/kernel; do
-            if [ -d "$d" ]; then
-              grep -rl MODULE_IMPORT_NS "$d" --include='*.c' --include='*.h' \
-                | xargs -r sed -i '/MODULE_IMPORT_NS/d'
-              if grep -rn MODULE_IMPORT_NS "$d" --include='*.c' --include='*.h'; then
-                echo "::error::Vẫn còn MODULE_IMPORT_NS trong $d"
-                exit 1
-              fi
-            fi
-          done
-          test -f drivers/kernelsu/feature/sucompat.c || {
-            echo "::error::Không tìm thấy drivers/kernelsu/feature/sucompat.c"
-            find . -path '*/sucompat.c' -print
-            exit 1
-          }
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/v3.2.0/kernel/setup.sh" | bash -s v3.2.0
+          ls KernelSU/kernel | head -30
+          test -f KernelSU/kernel/ksu.c || { echo "::error::Không thấy KernelSU/kernel/ksu.c"; exit 1; }
+          git -C KernelSU describe --tags --always
 
-      # Linux 4.19 của thiết bị này không cung cấp linux/pgtable.h.
-      # Thử dùng header kiến trúc ARM64 tương ứng trong sucompat.c.
-      - name: Vá pgtable header cho kernel 4.19
+      # Kernel 4.19 thiếu MODULE_IMPORT_NS (5.4+) và các hàm *_nofault (5.8+).
+      # Tạo header tương thích và ép include vào mọi file của KernelSU.
+      - name: Vá tương thích kernel 4.19
         working-directory: android/kernel/msm-4.19
         run: |
-          FILE="drivers/kernelsu/feature/sucompat.c"
-          if grep -q '^#include <linux/pgtable.h>' "$FILE"; then
-            sed -i 's|^#include <linux/pgtable.h>|#include <asm/pgtable.h>|' "$FILE"
-          fi
-          echo "Các header page-table trong sucompat.c:"
-          grep -nE 'pgtable\.h|page\.h' "$FILE" || true
-          if grep -q '^#include <linux/pgtable.h>' "$FILE"; then
-            echo "::error::Chưa thay được linux/pgtable.h"
-            exit 1
-          fi
-
-      # Kernel 4.19 không có strncpy_from_user_nofault(); dùng API có sẵn.
-      # Kiểm tra số vị trí thay thế để tránh âm thầm bỏ sót khi upstream đổi mã.
-      - name: Vá strncpy_from_user cho kernel 4.19
-        working-directory: android/kernel/msm-4.19
-        run: |
-          FILE="drivers/kernelsu/feature/sucompat.c"
-          test -f "$FILE" || { echo "::error::Không tìm thấy $FILE"; exit 1; }
-          COUNT=$(grep -o 'strncpy_from_user_nofault' "$FILE" | wc -l)
-          echo "Số vị trí API cũ: $COUNT"
-          test "$COUNT" -eq 2 || {
-            echo "::error::Số vị trí strncpy_from_user_nofault khác dự kiến; cần kiểm tra source"
-            grep -n 'strncpy_from_user' "$FILE" || true
-            exit 1
-          }
-          sed -i 's/strncpy_from_user_nofault/strncpy_from_user/g' "$FILE"
-          if grep -n 'strncpy_from_user_nofault' "$FILE"; then
-            echo "::error::Vẫn còn API không tương thích"
-            exit 1
-          fi
-          grep -n 'strncpy_from_user' "$FILE"
+          cat > include/linux/ksu_compat419.h <<'EOF2'
+          #ifndef _KSU_COMPAT419_H
+          #define _KSU_COMPAT419_H
+          /* Chỉ dùng macro, không include gì để an toàn khi bị -include sớm */
+          #define strncpy_from_user_nofault(dst, src, cnt) strncpy_from_user((dst), (src), (cnt))
+          #define copy_from_user_nofault(dst, src, size) ({ long __ksu_r; pagefault_disable(); __ksu_r = __copy_from_user_inatomic((dst), (src), (size)) ? -EFAULT : 0; pagefault_enable(); __ksu_r; })
+          #define copy_to_user_nofault(dst, src, size) ({ long __ksu_r; pagefault_disable(); __ksu_r = __copy_to_user_inatomic((dst), (src), (size)) ? -EFAULT : 0; pagefault_enable(); __ksu_r; })
+          #define copy_from_kernel_nofault(dst, src, size) probe_kernel_read((dst), (src), (size))
+          #define copy_to_kernel_nofault(dst, src, size) probe_kernel_write((dst), (src), (size))
+          #endif
+          EOF2
+          cat include/linux/ksu_compat419.h
+          echo 'subdir-ccflags-y += -include $(srctree)/include/linux/ksu_compat419.h' >> KernelSU/kernel/Makefile
+          grep -rl MODULE_IMPORT_NS KernelSU/kernel --include='*.c' --include='*.h' | xargs -r sed -i '/MODULE_IMPORT_NS/d'
+          ! grep -rn MODULE_IMPORT_NS KernelSU/kernel --include='*.c' --include='*.h'
 
       - name: Cấu hình
         working-directory: android/kernel/msm-4.19
@@ -126,35 +99,115 @@ jobs:
             -d MODULE_SIG_FORCE -d MODULE_SIG_ALL \
             --set-str LOCALVERSION "-perf" -d LOCALVERSION_AUTO \
             -e KPROBES -e KPROBE_EVENTS -e KALLSYMS -e KALLSYMS_ALL \
-            -e OVERLAY_FS -e KSU
+            -e OVERLAY_FS -e KSU -e KSU_KPROBES_HOOK
           make O=out ARCH=arm64 CC=clang olddefconfig
-          grep -E '^CONFIG_(KSU|KPROBES|MODULE_SIG_FORCE|LOCALVERSION)' out/.config
+          grep -E '^CONFIG_(KSU|KPROBES|KRETPROBES|EXT4_FS|OVERLAY_FS|MODULE_SIG_FORCE|LOCALVERSION)' out/.config
           grep -q '^CONFIG_KSU=y' out/.config || { echo "KSU KHÔNG được bật"; exit 1; }
+          grep -q '^CONFIG_KSU_KPROBES_HOOK=y' out/.config || { echo "KSU_KPROBES_HOOK KHÔNG được bật"; exit 1; }
 
       - name: Build
         working-directory: android/kernel/msm-4.19
         run: |
+          set -euo pipefail
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
-          make -j$(nproc) O=out ARCH=arm64 CC=clang LD=ld.lld \
+          make -j"$(nproc)" O=out ARCH=arm64 CC=clang LD=ld.lld \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             CLANG_TRIPLE=aarch64-linux-gnu- 2>&1 | tee build.log
-          ls out/arch/arm64/boot/
+          test -f out/arch/arm64/boot/Image
+          ls -lh out/arch/arm64/boot/
           strings out/arch/arm64/boot/Image | grep -m1 "Linux version"
 
-      - name: Đóng gói AnyKernel3
+      # Đóng gói bằng cách thay kernel trong boot.img gốc (giữ ramdisk, dtb, cmdline).
+      # Cần boot.img.xz (boot gốc của máy) nằm ở gốc repo, cạnh stock_config.txt.
+      # Không dùng AnyKernel3 vì file anykernel.sh mặc định là mẫu, chưa khai báo máy/phân vùng.
+      - name: Đóng gói boot.img (thay kernel vào boot gốc)
         run: |
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          set -euo pipefail
           B=android/kernel/msm-4.19/out/arch/arm64/boot
-          if   [ -f $B/Image.gz-dtb ]; then cp $B/Image.gz-dtb ak3/
-          elif [ -f $B/Image.gz ];     then cp $B/Image.gz ak3/
-          else cp $B/Image ak3/; fi
-          cd ak3 && rm -rf .git && zip -r9 ../kernel-ksu.zip .
+          if   [ -f "$B/Image.gz" ]; then cp "$B/Image.gz" kernel.gz
+          elif [ -f "$B/Image" ];    then gzip -9 -c "$B/Image" > kernel.gz
+          else echo "::error::Không tìm thấy kernel Image"; exit 1; fi
+          ls -l kernel.gz
+          cat > repack_boot.py <<'PY'
+          #!/usr/bin/env python3
+          """Thay kernel trong boot.img (header v0-v2), giữ nguyên ramdisk/dtb/cmdline."""
+          import struct, sys, hashlib
+
+          def pad(n, page): return (-n) % page
+
+          def main(stock, kernel, out):
+              d = open(stock, 'rb').read()
+              k = open(kernel, 'rb').read()
+              assert d[:8] == b'ANDROID!', 'không phải boot.img Android'
+              (ksz, kaddr, rsz, raddr, ssz, saddr, taddr, page, hv, osv) = struct.unpack_from('<10I', d, 8)
+              name = d[48:64]; cmd = d[64:576]; extra = d[608:1632]
+              assert hv <= 2, f'header v{hv} chưa hỗ trợ'
+              assert page in (2048, 4096, 8192, 16384), f'page size lạ: {page}'
+              # định dạng kernel: gốc và mới phải cùng loại (gzip hay raw)
+              kfmt = lambda b: 'gzip' if b[:2] == b'\x1f\x8b' else 'raw'
+              sk = d[page:page+ksz]
+              assert kfmt(sk) == kfmt(k), f'kernel gốc là {kfmt(sk)} nhưng kernel mới là {kfmt(k)}'
+              rdsz = rdoff = hdrsz = dtbsz = 0; dtbaddr = 0
+              if hv >= 1:
+                  rdsz, rdoff, hdrsz = struct.unpack_from('<IQI', d, 1632)
+              if hv == 2:
+                  dtbsz, dtbaddr = struct.unpack_from('<IQ', d, 1648)
+              if hv >= 1:
+                  assert hdrsz == {1: 1648, 2: 1660}[hv], f'header_size {hdrsz} không khớp header v{hv}'
+                  exp = page + sum(n + pad(n, page) for n in (ksz, rsz, ssz))
+                  assert rdsz == 0 or rdoff == exp, f'recovery_dtbo_offset {rdoff} khác vị trí tính được {exp}'
+              pos = page
+              def take(n):
+                  nonlocal pos
+                  assert pos + n <= len(d), f'boot gốc bị cắt: cần {n} byte tại {pos}, file chỉ {len(d)}'
+                  b = d[pos:pos+n]; pos += n + pad(n, page); return b
+              old_k = take(ksz); ram = take(rsz); sec = take(ssz)
+              rdt = take(rdsz) if hv >= 1 else b''
+              dtb = take(dtbsz) if hv == 2 else b''
+              new_rdoff = page + len(k) + pad(len(k), page) + len(ram) + pad(len(ram), page) + len(sec) + pad(len(sec), page)
+              sha = hashlib.sha1()
+              for b in (k, ram, sec):
+                  sha.update(b); sha.update(struct.pack('<I', len(b)))
+              if hv >= 1: sha.update(rdt); sha.update(struct.pack('<I', len(rdt)))
+              if hv == 2: sha.update(dtb); sha.update(struct.pack('<I', len(dtb)))
+              idb = sha.digest() + b'\0' * 12
+              h = bytearray(page)
+              h[0:8] = b'ANDROID!'
+              struct.pack_into('<10I', h, 8, len(k), kaddr, rsz, raddr, ssz, saddr, taddr, page, hv, osv)
+              h[48:64] = name; h[64:576] = cmd; h[576:608] = idb; h[608:1632] = extra
+              if hv >= 1: struct.pack_into('<IQI', h, 1632, rdsz, new_rdoff if rdsz else 0, hdrsz)
+              if hv == 2: struct.pack_into('<IQ', h, 1648, dtbsz, dtbaddr)
+              with open(out, 'wb') as f:
+                  f.write(h)
+                  for b in (k, ram, sec, rdt, dtb):
+                      f.write(b); f.write(b'\0' * pad(len(b), page))
+              # đọc lại ảnh vừa ghi và đối chiếu từng thành phần
+              o = open(out, 'rb').read()
+              p2 = page
+              for name_, want in (('kernel', k), ('ramdisk', ram), ('second', sec), ('recovery_dtbo', rdt), ('dtb', dtb)):
+                  assert o[p2:p2+len(want)] == want, f'đọc lại {name_} không khớp'
+                  p2 += len(want) + pad(len(want), page)
+              assert len(o) == p2, 'kích thước ảnh ra không khớp'
+              assert struct.unpack_from('<I', o, 8)[0] == len(k), 'kernel_size trong header sai'
+              print(f'header v{hv} page={page} kernel {len(old_k)} -> {len(k)} ramdisk={len(ram)} dtb={len(dtb)}')
+
+          if __name__ == '__main__':
+              main(*sys.argv[1:4])
+          PY
+          if [ -f boot.img.xz ]; then
+            xz -dkc boot.img.xz > stock_boot.img
+            python3 repack_boot.py stock_boot.img kernel.gz boot-new.img
+            ls -l boot-new.img
+          else
+            echo "::warning::Không thấy boot.img.xz trong repo; chỉ xuất kernel.gz"
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: kernel-ksu
           path: |
-            kernel-ksu.zip
+            kernel.gz
+            boot-new.img
             android/kernel/msm-4.19/build.log
