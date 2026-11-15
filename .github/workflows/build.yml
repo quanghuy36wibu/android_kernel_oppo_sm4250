@@ -89,6 +89,27 @@ jobs:
             exit 1
           fi
 
+      # Kernel 4.19 không có strncpy_from_user_nofault(); dùng API có sẵn.
+      # Kiểm tra số vị trí thay thế để tránh âm thầm bỏ sót khi upstream đổi mã.
+      - name: Vá strncpy_from_user cho kernel 4.19
+        working-directory: android/kernel/msm-4.19
+        run: |
+          FILE="drivers/kernelsu/feature/sucompat.c"
+          test -f "$FILE" || { echo "::error::Không tìm thấy $FILE"; exit 1; }
+          COUNT=$(grep -o 'strncpy_from_user_nofault' "$FILE" | wc -l)
+          echo "Số vị trí API cũ: $COUNT"
+          test "$COUNT" -eq 2 || {
+            echo "::error::Số vị trí strncpy_from_user_nofault khác dự kiến; cần kiểm tra source"
+            grep -n 'strncpy_from_user' "$FILE" || true
+            exit 1
+          }
+          sed -i 's/strncpy_from_user_nofault/strncpy_from_user/g' "$FILE"
+          if grep -n 'strncpy_from_user_nofault' "$FILE"; then
+            echo "::error::Vẫn còn API không tương thích"
+            exit 1
+          fi
+          grep -n 'strncpy_from_user' "$FILE"
+
       - name: Cấu hình
         working-directory: android/kernel/msm-4.19
         run: |
