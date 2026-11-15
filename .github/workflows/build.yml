@@ -56,6 +56,9 @@ jobs:
         run: |
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
           ls drivers/kernelsu | head
+          # Kernel 4.19 chưa có MODULE_IMPORT_NS (từ 5.4) -> bỏ các dòng này
+          grep -rl MODULE_IMPORT_NS KernelSU/kernel | xargs -r sed -i '/MODULE_IMPORT_NS/d'
+          grep -rn MODULE_IMPORT_NS KernelSU/kernel || echo "đã bỏ MODULE_IMPORT_NS"
 
       - name: Cấu hình
         working-directory: android/kernel/msm-4.19
